@@ -2150,7 +2150,7 @@ fn generateCom(sdk_file: *SdkFile, writer: *CodeWriter, type_obj: json.ObjectMap
         }
         for (com_methods.items) |*method_node_ptr| {
             const method_obj = method_node_ptr.object;
-            const method_name = (try jsonObjGetRequired(method_obj, "Name", sdk_file)).string;
+            var method_name = (try jsonObjGetRequired(method_obj, "Name", sdk_file)).string;
             const return_type = (try jsonObjGetRequired(method_obj, "ReturnType", sdk_file)).object;
             const remap_sig = try shouldRemapSig(return_type, sdk_file);
             const params = (try jsonObjGetRequired(method_obj, "Params", sdk_file)).array;
@@ -2158,11 +2158,12 @@ fn generateCom(sdk_file: *SdkFile, writer: *CodeWriter, type_obj: json.ObjectMap
             const count = method_conflicts.get(method_name) orelse 0;
             try method_conflicts.put(method_name, count + 1);
 
-            try writer.line("        // NOTE: method is namespaced with interface name to avoid conflicts for now");
-            try writer.writef("        pub fn {s}_{s}", .{ com_pool_name, method_name }, .{ .nl = false });
+            try writer.writef("        pub fn @\"{c}{s}", .{ std.ascii.toLower(method_name[0]), method_name[1..] }, .{ .nl = false });
             if (count > 0) {
                 try writer.writef("{}", .{count}, .{ .start = .mid, .nl = false });
             }
+            try writer.write("\"", .{ .start = .mid, .nl = false });
+
             try writer.write("(self: *const T", .{ .start = .mid, .nl = false });
             for (params.items) |*param_node_ptr| {
                 const param_obj = param_node_ptr.object;
@@ -2780,13 +2781,7 @@ pub const FmtParamId = struct {
     ) !void {
         _ = fmt;
         _ = options;
-        if (self.avoid_lookup(self.s)) |_| {
-            try writer.print("_param_{s}", .{self.s});
-        } else if (isBuiltinId(self.s)) {
-            try writer.print("{s}_", .{self.s});
-        } else {
-            try writer.print("{}", .{std.zig.fmtId(self.s)});
-        }
+        try writer.print("{s}_", .{self.s});
     }
 };
 pub fn fmtParamId(s: []const u8, avoid_lookup: AvoidLookupFn) FmtParamId {

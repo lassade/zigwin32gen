@@ -630,6 +630,15 @@ fn readAndGenerateApiFile(root_module: *Module, out_dir: std.fs.Dir, json_basena
 
     const generate_start_millis = std.time.milliTimestamp();
     try generateFile(module_dir, module, json_tree);
+
+    const file_path = try module_dir.realpathAlloc(allocator, module.zig_basename);
+    defer allocator.free(file_path);
+    var fmt_file = std.ChildProcess.init(
+        &[_][]const u8{ "zig", "fmt", file_path },
+        allocator,
+    );
+    _ = try fmt_file.spawnAndWait();
+
     global_times.generate_time_millis += std.time.milliTimestamp() - generate_start_millis;
 }
 
@@ -2137,7 +2146,13 @@ fn generateCom(sdk_file: *SdkFile, writer: *CodeWriter, type_obj: json.ObjectMap
 
     // some COM objects have methods with the same name and only differ in parameter types
     var method_conflicts = StringHashMap(u8).init(allocator);
-    defer method_conflicts.deinit();
+    defer {
+        var it = method_conflicts.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+        }
+        method_conflicts.deinit();
+    }
 
     // Generate wrapper methods for every entry in the vtable
     try writer.line("    pub fn MethodMixin(comptime T: type) type { return struct {");
@@ -2150,17 +2165,41 @@ fn generateCom(sdk_file: *SdkFile, writer: *CodeWriter, type_obj: json.ObjectMap
         }
         for (com_methods.items) |*method_node_ptr| {
             const method_obj = method_node_ptr.object;
-            var method_name = (try jsonObjGetRequired(method_obj, "Name", sdk_file)).string;
+            const method_name = (try jsonObjGetRequired(method_obj, "Name", sdk_file)).string;
             const return_type = (try jsonObjGetRequired(method_obj, "ReturnType", sdk_file)).object;
             const remap_sig = try shouldRemapSig(return_type, sdk_file);
             const params = (try jsonObjGetRequired(method_obj, "Params", sdk_file)).array;
 
-            const count = method_conflicts.get(method_name) orelse 0;
-            try method_conflicts.put(method_name, count + 1);
+            // zigify method_name
+            var tmp: [128]u8 = undefined;
+            var tmp_len: usize = 0;
+            var upper: bool = false;
+            for (method_name) |ch| {
+                if (ch == '_') {
+                    upper = true;
+                    continue;
+                }
+                if (upper) {
+                    tmp[tmp_len] = std.ascii.toUpper(ch);
+                    upper = false;
+                } else {
+                    tmp[tmp_len] = ch;
+                }
+                tmp_len += 1;
+            }
+            tmp[0] = std.ascii.toLower(tmp[0]);
 
-            try writer.writef("        pub fn @\"{c}{s}", .{ std.ascii.toLower(method_name[0]), method_name[1..] }, .{ .nl = false });
-            if (count > 0) {
-                try writer.writef("{}", .{count}, .{ .start = .mid, .nl = false });
+            const result = try method_conflicts.getOrPut(tmp[0..tmp_len]);
+            if (result.found_existing) {
+                result.value_ptr.* += 1;
+            } else {
+                result.key_ptr.* = try allocator.dupe(u8, tmp[0..tmp_len]);
+                result.value_ptr.* = 0;
+            }
+
+            try writer.writef("        pub fn @\"{s}", .{tmp[0..tmp_len]}, .{ .nl = false });
+            if (result.value_ptr.* > 0) {
+                try writer.writef("{d}", .{result.value_ptr.*}, .{ .start = .mid, .nl = false });
             }
             try writer.write("\"", .{ .start = .mid, .nl = false });
 
@@ -2469,27 +2508,22 @@ fn generateFunction(
             try writer.linef("pub extern \"{s}\" fn {s}(", .{ fmtLower(dll_import, 100), std.zig.fmtId(func_name_tmp) });
         },
         .ptr => |ptr_data_union| switch (ptr_data_union) {
-            .stage1 => try writer.line(".stage1 => fn("),
-            .not_stage1 => try writer.line("else => *const fn("),
+            .stage1 => unreachable,
+            .not_stage1 => {},
             .both => |ptr_data| {
-                try writer.linef("{s}switch (@import(\"builtin\").zig_backend) {{", .{ptr_data.def_prefix});
-                writer.depth += 1;
-                try generateFunction(sdk_file, writer, function_obj, .{ .ptr = .stage1 });
+                try writer.linef("{s}*const fn(", .{ptr_data.def_prefix});
                 try generateFunction(sdk_file, writer, function_obj, .{ .ptr = .not_stage1 });
-                writer.depth -= 1;
-                try writer.linef("}} {s}", .{ptr_data.def_suffix});
+                try writer.writef("{s}", .{ptr_data.def_suffix}, .{ .start = .mid });
                 return;
             },
         },
         .com => |com_data_union| {
             const self_type = blk: {
                 switch (com_data_union) {
-                    .stage1 => |com_data| {
-                        try writer.line(".stage1 => fn(");
-                        break :blk com_data.self_type;
+                    .stage1 => |_| {
+                        unreachable;
                     },
                     .not_stage1 => |com_data| {
-                        try writer.line("else => *const fn(");
                         break :blk com_data.self_type;
                     },
                     .both => |com_data| {
@@ -2498,12 +2532,9 @@ fn generateFunction(
                         } else {
                             try writer.writef("{s}", .{std.zig.fmtId(func_name_tmp)}, .{ .nl = false });
                         }
-                        try writer.write(": switch (@import(\"builtin\").zig_backend) {", .{ .start = .mid });
-                        writer.depth += 1;
-                        try generateFunction(sdk_file, writer, function_obj, .{ .com = .{ .stage1 = .{ .self_type = com_data.self_type } } });
+                        try writer.write(": *const fn(", .{ .start = .mid });
                         try generateFunction(sdk_file, writer, function_obj, .{ .com = .{ .not_stage1 = .{ .self_type = com_data.self_type } } });
-                        writer.depth -= 1;
-                        try writer.line("},");
+                        try writer.write(",", .{ .start = .mid });
                         return;
                     },
                 }
@@ -2533,15 +2564,9 @@ fn generateFunction(
         const return_type_formatter = try addTypeRefs(sdk_file, arches, return_type, return_opts, null);
         try generateTypeRef(sdk_file, writer, return_type_formatter);
     }
-    const term = switch (func_kind) {
-        .fixed => ";",
-        .ptr => |ptr_data| switch (ptr_data) {
-            .stage1, .not_stage1 => ",",
-            .both => @panic("code bug"),
-        },
-        .com => ",",
-    };
-    try writer.writef("{s}", .{term}, .{ .start = .mid });
+    if (func_kind == .fixed) {
+        try writer.write(";", .{ .start = .mid });
+    }
 }
 
 fn generateParams(

@@ -2187,7 +2187,20 @@ fn generateCom(sdk_file: *SdkFile, writer: *CodeWriter, type_obj: json.ObjectMap
                 }
                 tmp_len += 1;
             }
-            tmp[0] = std.ascii.toLower(tmp[0]);
+
+            if (std.ascii.isUpper(tmp[0])) {
+                tmp[0] = std.ascii.toLower(tmp[0]);
+                for (1..tmp_len) |i| {
+                    if (std.ascii.isUpper(tmp[i]) or std.ascii.isDigit(tmp[i])) {
+                        tmp[i - 1] = std.ascii.toLower(tmp[i - 1]);
+                        if (i == tmp_len - 1) {
+                            tmp[i] = std.ascii.toLower(tmp[i]);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
 
             const result = try method_conflicts.getOrPut(tmp[0..tmp_len]);
             if (result.found_existing) {
